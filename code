@@ -1,0 +1,951 @@
+# ==============================================================
+# 👻 GitGhost V24 - Real Git Repository Secret Scanner
+# Google Colab - ONE CELL
+# Authorized Security Auditing Only
+# ==============================================================
+
+import os
+import re
+import csv
+import json
+import html
+import math
+import shutil
+import hashlib
+import subprocess
+from pathlib import Path
+from datetime import datetime
+
+# -----------------------------
+# Configuration
+# -----------------------------
+
+WORK_DIR = Path("/content/gitghost_v24")
+REPO_DIR = WORK_DIR / "repository"
+REPORT_DIR = WORK_DIR / "reports"
+
+MAX_FILE_SIZE = 2 * 1024 * 1024  # 2 MB
+MAX_FINDINGS = 1000
+
+WORK_DIR.mkdir(exist_ok=True)
+REPORT_DIR.mkdir(exist_ok=True)
+
+# -----------------------------
+# Banner
+# -----------------------------
+
+print("""
+╔════════════════════════════════════════════════════════════╗
+║                    👻 GITGHOST V24                        ║
+║             REAL SECRET SECURITY SCANNER                  ║
+║          Google Colab • Authorized Audit Mode             ║
+╚════════════════════════════════════════════════════════════╝
+""")
+
+print("⚠️  Scan only repositories you own or are authorized to audit.")
+print()
+
+# -----------------------------
+# Input
+# -----------------------------
+
+repo_url = input("🔗 GitHub repository URL: ").strip()
+
+if not repo_url:
+    raise ValueError("Repository URL is required.")
+
+if not re.match(
+    r"^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/?$",
+    repo_url
+):
+    raise ValueError(
+        "Please enter a valid public GitHub repository URL, e.g. "
+        "https://github.com/user/project"
+    )
+
+github_token = input(
+    "🔐 GitHub token (optional, press Enter for public repo): "
+).strip()
+
+# -----------------------------
+# Clean previous scan
+# -----------------------------
+
+if REPO_DIR.exists():
+    shutil.rmtree(REPO_DIR)
+
+REPO_DIR.mkdir(parents=True, exist_ok=True)
+
+for item in REPORT_DIR.iterdir():
+    if item.is_file():
+        item.unlink()
+
+# -----------------------------
+# Clone repository
+# -----------------------------
+
+print("\n[1/7] 📥 Downloading repository...")
+
+clone_url = repo_url
+
+# Token is used only for authenticated cloning.
+# Never print the token.
+if github_token:
+    clone_url = repo_url.replace(
+        "https://github.com/",
+        f"https://x-access-token:{github_token}@github.com/",
+        1
+    )
+
+result = subprocess.run(
+    ["git", "clone", "--quiet", "--depth", "50", clone_url, str(REPO_DIR)],
+    capture_output=True,
+    text=True
+)
+
+if result.returncode != 0:
+    print("\n❌ Repository clone failed.")
+    print("Possible reasons:")
+    print("• Repository is private and token is invalid")
+    print("• Repository does not exist")
+    print("• Repository URL is incorrect")
+    print("• Network problem")
+    raise RuntimeError(result.stderr[-1000:])
+
+print("✓ Repository downloaded")
+
+# -----------------------------
+# Secret rules
+# -----------------------------
+
+RULES = [
+
+    # Generic credentials
+    (
+        "Generic API Key",
+        "HIGH",
+        r"(?i)\b(?:api[_-]?key|apikey)\b\s*[:=]\s*['\"]?([A-Za-z0-9_\-]{16,})"
+    ),
+
+    (
+        "Generic Access Token",
+        "HIGH",
+        r"(?i)\b(?:access[_-]?token|auth[_-]?token)\b\s*[:=]\s*['\"]?([A-Za-z0-9_\-\.]{20,})"
+    ),
+
+    (
+        "Generic Password",
+        "HIGH",
+        r"(?i)\b(?:password|passwd|pwd)\b\s*[:=]\s*['\"]([^'\"]{6,})['\"]"
+    ),
+
+    # AWS
+    (
+        "AWS Access Key",
+        "CRITICAL",
+        r"\bAKIA[0-9A-Z]{16}\b"
+    ),
+
+    (
+        "AWS Secret Key",
+        "CRITICAL",
+        r"(?i)\b(?:aws_secret_access_key|aws_secret_key)\b\s*[:=]\s*['\"]?([A-Za-z0-9/+=]{30,})"
+    ),
+
+    # GitHub
+    (
+        "GitHub Token",
+        "CRITICAL",
+        r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b"
+    ),
+
+    (
+        "GitHub OAuth Token",
+        "HIGH",
+        r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"
+    ),
+
+    # Slack
+    (
+        "Slack Token",
+        "HIGH",
+        r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"
+    ),
+
+    # Google
+    (
+        "Google API Key",
+        "HIGH",
+        r"\bAIza[0-9A-Za-z_-]{35}\b"
+    ),
+
+    # Stripe
+    (
+        "Stripe Secret Key",
+        "CRITICAL",
+        r"\bsk_(?:live|test)_[A-Za-z0-9]{16,}\b"
+    ),
+
+    # Private keys
+    (
+        "Private Key",
+        "CRITICAL",
+        r"-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----"
+    ),
+
+    # JWT
+    (
+        "JWT Token",
+        "HIGH",
+        r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"
+    ),
+
+    # Database URLs
+    (
+        "Database Connection String",
+        "HIGH",
+        r"(?i)\b(?:mongodb(?:\+srv)?|postgres(?:ql)?|mysql|redis)://[^\s'\"<>]+"
+    ),
+
+    # Generic bearer token
+    (
+        "Bearer Token",
+        "HIGH",
+        r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{20,}"
+    ),
+
+    # Basic auth URL
+    (
+        "URL Credential",
+        "HIGH",
+        r"(?i)\bhttps?://[^/\s:@]+:[^/\s@]+@[^/\s]+"
+    ),
+
+    # Generic secret assignment
+    (
+        "Generic Secret",
+        "MEDIUM",
+        r"(?i)\b(?:secret|client_secret|private_key|credential)\b\s*[:=]\s*['\"]([^'\"]{10,})['\"]"
+    )
+]
+
+# -----------------------------
+# File filtering
+# -----------------------------
+
+IGNORE_DIRS = {
+    ".git",
+    "node_modules",
+    "__pycache__",
+    ".venv",
+    "venv",
+    "dist",
+    "build",
+    ".next",
+    ".cache"
+}
+
+TEXT_EXTENSIONS = {
+    ".py", ".js", ".ts", ".tsx", ".jsx",
+    ".java", ".c", ".cpp", ".h", ".hpp",
+    ".cs", ".go", ".rs", ".php",
+    ".rb", ".swift", ".kt",
+    ".json", ".yaml", ".yml",
+    ".xml", ".ini", ".cfg", ".conf",
+    ".env", ".txt", ".md",
+    ".sh", ".bat", ".ps1",
+    ".toml", ".properties",
+    ".sql", ".html", ".css"
+}
+
+SENSITIVE_FILENAMES = {
+    ".env",
+    ".env.local",
+    ".env.production",
+    ".env.development",
+    "credentials",
+    "credentials.json",
+    "config.json",
+    "secrets.json",
+    "settings.json"
+}
+
+# -----------------------------
+# Helper functions
+# -----------------------------
+
+def mask_secret(value):
+    value = str(value)
+
+    if len(value) <= 8:
+        return "*" * len(value)
+
+    return value[:4] + "*" * (len(value) - 7) + value[-3:]
+
+
+def entropy(text):
+    if not text:
+        return 0.0
+
+    counts = {}
+    for char in text:
+        counts[char] = counts.get(char, 0) + 1
+
+    length = len(text)
+
+    return -sum(
+        (count / length) * math.log2(count / length)
+        for count in counts.values()
+    )
+
+
+def confidence(secret, pattern_type):
+    score = 60
+
+    if len(secret) >= 20:
+        score += 10
+
+    if len(secret) >= 32:
+        score += 10
+
+    ent = entropy(secret)
+
+    if ent >= 3.5:
+        score += 10
+
+    if pattern_type in {
+        "AWS Access Key",
+        "GitHub Token",
+        "Private Key",
+        "Stripe Secret Key"
+    }:
+        score += 10
+
+    return min(score, 99)
+
+
+def sha256_text(text):
+    return hashlib.sha256(text.encode(errors="ignore")).hexdigest()
+
+
+def is_probably_text(path):
+    try:
+        with open(path, "rb") as f:
+            chunk = f.read(4096)
+
+        if b"\x00" in chunk:
+            return False
+
+        return True
+
+    except Exception:
+        return False
+
+
+def severity_weight(severity):
+    return {
+        "CRITICAL": 25,
+        "HIGH": 15,
+        "MEDIUM": 8,
+        "LOW": 3
+    }.get(severity, 1)
+
+
+# -----------------------------
+# Scan files
+# -----------------------------
+
+print("\n[2/7] 🔎 Discovering files...")
+
+files = []
+
+for root, dirs, filenames in os.walk(REPO_DIR):
+
+    dirs[:] = [
+        d for d in dirs
+        if d not in IGNORE_DIRS
+    ]
+
+    for filename in filenames:
+
+        path = Path(root) / filename
+
+        try:
+            if path.stat().st_size > MAX_FILE_SIZE:
+                continue
+        except:
+            continue
+
+        if (
+            path.suffix.lower() in TEXT_EXTENSIONS
+            or filename.lower() in SENSITIVE_FILENAMES
+            or filename.startswith(".env")
+        ):
+            files.append(path)
+
+print(f"✓ Candidate files: {len(files)}")
+
+# -----------------------------
+# Pattern scanning
+# -----------------------------
+
+print("\n[3/7] 🧠 Running secret detection engine...")
+
+findings = []
+seen = set()
+
+for path in files:
+
+    try:
+        if not is_probably_text(path):
+            continue
+
+        content = path.read_text(
+            encoding="utf-8",
+            errors="ignore"
+        )
+
+    except Exception:
+        continue
+
+    relative = str(path.relative_to(REPO_DIR))
+
+    lines = content.splitlines()
+
+    for line_number, line in enumerate(lines, 1):
+
+        # -------------------------
+        # Regex rules
+        # -------------------------
+
+        for rule_name, severity, pattern in RULES:
+
+            try:
+                matches = re.finditer(
+                    pattern,
+                    line
+                )
+            except re.error:
+                continue
+
+            for match in matches:
+
+                raw = match.group(0)
+
+                # Don't report tiny values
+                if len(raw.strip()) < 8:
+                    continue
+
+                key = (
+                    relative,
+                    line_number,
+                    rule_name,
+                    sha256_text(raw)[:16]
+                )
+
+                if key in seen:
+                    continue
+
+                seen.add(key)
+
+                conf = confidence(
+                    raw,
+                    rule_name
+                )
+
+                findings.append({
+                    "id": f"GG-{len(findings)+1:04d}",
+                    "type": rule_name,
+                    "severity": severity,
+                    "confidence": conf,
+                    "file": relative,
+                    "line": line_number,
+                    "source": "Current File",
+                    "detected": mask_secret(raw),
+                    "fingerprint": sha256_text(raw)[:16],
+                    "recommendation":
+                        "Remove the credential and rotate it if it is real."
+                })
+
+                if len(findings) >= MAX_FINDINGS:
+                    break
+
+            if len(findings) >= MAX_FINDINGS:
+                break
+
+        if len(findings) >= MAX_FINDINGS:
+            break
+
+        # -------------------------
+        # Entropy detection
+        # -------------------------
+
+        # Look for long assignment values
+        entropy_matches = re.finditer(
+            r"(?i)\b(?:key|token|secret|password|credential|value)\b"
+            r"\s*[:=]\s*['\"]([A-Za-z0-9_\-+/=.]{20,})['\"]",
+            line
+        )
+
+        for match in entropy_matches:
+
+            value = match.group(1)
+
+            ent = entropy(value)
+
+            if ent < 4.0:
+                continue
+
+            key = (
+                relative,
+                line_number,
+                "High Entropy Secret",
+                sha256_text(value)[:16]
+            )
+
+            if key in seen:
+                continue
+
+            seen.add(key)
+
+            findings.append({
+                "id": f"GG-{len(findings)+1:04d}",
+                "type": "High Entropy Secret",
+                "severity": "MEDIUM",
+                "confidence": min(
+                    95,
+                    int(65 + ent * 6)
+                ),
+                "file": relative,
+                "line": line_number,
+                "source": "Entropy Analysis",
+                "detected": mask_secret(value),
+                "fingerprint": sha256_text(value)[:16],
+                "recommendation":
+                    "Review this high-entropy value and move real credentials to environment variables."
+            })
+
+        if len(findings) >= MAX_FINDINGS:
+            break
+
+# -----------------------------
+# Git history
+# -----------------------------
+
+print("\n[4/7] 🕐 Checking Git history...")
+
+history_findings = []
+
+git_result = subprocess.run(
+    [
+        "git",
+        "-C",
+        str(REPO_DIR),
+        "log",
+        "--all",
+        "-p",
+        "--format="
+    ],
+    capture_output=True,
+    text=True,
+    errors="ignore"
+)
+
+history_text = git_result.stdout
+
+if history_text:
+
+    history_lines = history_text.splitlines()
+
+    for line_number, line in enumerate(history_lines, 1):
+
+        if line.startswith("-") or line.startswith("+"):
+
+            for rule_name, severity, pattern in RULES:
+
+                try:
+                    matches = re.finditer(
+                        pattern,
+                        line
+                    )
+                except:
+                    continue
+
+                for match in matches:
+
+                    raw = match.group(0)
+
+                    if len(raw.strip()) < 8:
+                        continue
+
+                    fingerprint = sha256_text(raw)[:16]
+
+                    if any(
+                        f["fingerprint"] == fingerprint
+                        for f in findings
+                    ):
+                        continue
+
+                    history_findings.append({
+                        "id": f"GG-H{len(history_findings)+1:04d}",
+                        "type": rule_name,
+                        "severity": severity,
+                        "confidence": confidence(
+                            raw,
+                            rule_name
+                        ),
+                        "file": "Git History",
+                        "line": line_number,
+                        "source": "Git History",
+                        "detected": mask_secret(raw),
+                        "fingerprint": fingerprint,
+                        "recommendation":
+                            "Review the affected commit and rotate the credential if real."
+                    })
+
+                    if len(history_findings) >= 200:
+                        break
+
+                if len(history_findings) >= 200:
+                    break
+
+        if len(history_findings) >= 200:
+            break
+
+findings.extend(history_findings)
+
+# -----------------------------
+# Statistics
+# -----------------------------
+
+print("\n[5/7] 📊 Calculating security score...")
+
+critical = sum(
+    1 for f in findings if f["severity"] == "CRITICAL"
+)
+
+high = sum(
+    1 for f in findings if f["severity"] == "HIGH"
+)
+
+medium = sum(
+    1 for f in findings if f["severity"] == "MEDIUM"
+)
+
+low = sum(
+    1 for f in findings if f["severity"] == "LOW"
+)
+
+score = 100
+
+for f in findings:
+    score -= severity_weight(f["severity"])
+
+score = max(0, min(100, score))
+
+if score >= 90:
+    grade = "A"
+elif score >= 80:
+    grade = "B"
+elif score >= 70:
+    grade = "C"
+elif score >= 60:
+    grade = "D"
+else:
+    grade = "F"
+
+commits_result = subprocess.run(
+    [
+        "git",
+        "-C",
+        str(REPO_DIR),
+        "rev-list",
+        "--all",
+        "--count"
+    ],
+    capture_output=True,
+    text=True
+)
+
+try:
+    commit_count = int(
+        commits_result.stdout.strip() or 0
+    )
+except:
+    commit_count = 0
+
+branch_result = subprocess.run(
+    [
+        "git",
+        "-C",
+        str(REPO_DIR),
+        "branch",
+        "-a"
+    ],
+    capture_output=True,
+    text=True
+)
+
+branches = [
+    x.strip()
+    for x in branch_result.stdout.splitlines()
+    if x.strip()
+]
+
+# Count lines
+total_lines = 0
+
+for path in files:
+
+    try:
+        total_lines += len(
+            path.read_text(
+                encoding="utf-8",
+                errors="ignore"
+            ).splitlines()
+        )
+    except:
+        pass
+
+# -----------------------------
+# Save JSON
+# -----------------------------
+
+json_report = {
+    "tool": "GitGhost",
+    "version": "V24",
+    "scan_time": datetime.utcnow().isoformat() + "Z",
+    "target": repo_url,
+    "authorized_audit_mode": True,
+    "statistics": {
+        "files_scanned": len(files),
+        "lines_scanned": total_lines,
+        "commits_checked": commit_count,
+        "branches": len(branches),
+        "findings": len(findings),
+        "critical": critical,
+        "high": high,
+        "medium": medium,
+        "low": low,
+        "security_score": score,
+        "grade": grade
+    },
+    "findings": findings
+}
+
+json_path = REPORT_DIR / "gitghost_report.json"
+
+with open(
+    json_path,
+    "w",
+    encoding="utf-8"
+) as f:
+
+    json.dump(
+        json_report,
+        f,
+        indent=2
+    )
+
+# -----------------------------
+# CSV
+# -----------------------------
+
+csv_path = REPORT_DIR / "gitghost_report.csv"
+
+with open(
+    csv_path,
+    "w",
+    newline="",
+    encoding="utf-8"
+) as f:
+
+    writer = csv.DictWriter(
+        f,
+        fieldnames=[
+            "id",
+            "type",
+            "severity",
+            "confidence",
+            "file",
+            "line",
+            "source",
+            "detected",
+            "fingerprint",
+            "recommendation"
+        ]
+    )
+
+    writer.writeheader()
+
+    writer.writerows(findings)
+
+# -----------------------------
+# HTML report
+# -----------------------------
+
+html_path = REPORT_DIR / "gitghost_report.html"
+
+rows = ""
+
+for f in findings:
+
+    rows += f"""
+    <tr>
+        <td>{html.escape(f["id"])}</td>
+        <td>{html.escape(f["type"])}</td>
+        <td>{html.escape(f["severity"])}</td>
+        <td>{f["confidence"]}%</td>
+        <td>{html.escape(f["file"])}</td>
+        <td>{f["line"]}</td>
+        <td>{html.escape(f["source"])}</td>
+        <td><code>{html.escape(f["detected"])}</code></td>
+    </tr>
+    """
+
+html_report = f"""
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>GitGhost V24 Report</title>
+<style>
+body {{
+    font-family: Arial, sans-serif;
+    background:#111827;
+    color:#f9fafb;
+    padding:30px;
+}}
+.card {{
+    background:#1f2937;
+    padding:20px;
+    margin-bottom:20px;
+    border-radius:12px;
+}}
+table {{
+    width:100%;
+    border-collapse:collapse;
+}}
+th,td {{
+    padding:10px;
+    border:1px solid #374151;
+    text-align:left;
+}}
+th {{
+    background:#374151;
+}}
+code {{
+    color:#fbbf24;
+}}
+</style>
+</head>
+<body>
+
+<h1>👻 GitGhost V24</h1>
+<p>Authorized Security Audit Report</p>
+
+<div class="card">
+<h2>Repository</h2>
+<p>{html.escape(repo_url)}</p>
+</div>
+
+<div class="card">
+<h2>Security Summary</h2>
+<p>Files: {len(files)}</p>
+<p>Lines: {total_lines}</p>
+<p>Commits: {commit_count}</p>
+<p>Findings: {len(findings)}</p>
+<p>Critical: {critical}</p>
+<p>High: {high}</p>
+<p>Medium: {medium}</p>
+<p>Low: {low}</p>
+<p><strong>Score: {score}/100</strong></p>
+<p><strong>Grade: {grade}</strong></p>
+</div>
+
+<div class="card">
+<h2>Findings</h2>
+
+<table>
+<tr>
+<th>ID</th>
+<th>Type</th>
+<th>Severity</th>
+<th>Confidence</th>
+<th>File</th>
+<th>Line</th>
+<th>Source</th>
+<th>Detected</th>
+</tr>
+
+{rows}
+
+</table>
+</div>
+
+</body>
+</html>
+"""
+
+html_path.write_text(
+    html_report,
+    encoding="utf-8"
+)
+
+# -----------------------------
+# SARIF report
+# -----------------------------
+
+sarif_results = []
+
+for f in findings:
+
+    level = {
+        "CRITICAL": "error",
+        "HIGH": "error",
+        "MEDIUM": "warning",
+        "LOW": "note"
+    }.get(f["severity"], "warning")
+
+    sarif_results.append({
+        "ruleId": f["type"].replace(" ", "_"),
+        "level": level,
+        "message": {
+            "text":
+                f"Potential {f['type']} detected. "
+                f"Secret value masked."
+        },
+        "locations": [
+            {
+                "physicalLocation": {
+                    "artifactLocation": {
+                        "uri": f["file"]
+                    },
+                    "region": {
+                        "startLine": f["line"]
+                    }
+                }
+            }
+        ]
+    })
+
+sarif = {
+    "$schema":
+        "https://json.schemastore.org/sarif-2.1.0.json",
+    "version": "2.1.0",
+    "runs": [
+        {
+            "tool": {
+                "driver": {
+                    "name": "GitGhost",
+                    "version": "24.0"
+                }
+            },
+            "results": sarif_results
+        }
+    ]
+}
+
+sarif_path = REPORT_DIR / "gitghost_report.sarif"
+
+sarif_path.w
